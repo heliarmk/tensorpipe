@@ -85,7 +85,7 @@ class SendOperation {
 
   void process(const cudaIpcEventHandle_t& stopEvHandle) {
     CudaEvent stopEv(stopEvHandle);
-    stopEv.wait(stream_);
+    stopEv.wait(stream_, cudaDeviceForPointer(ptr_));
   }
 
  private:
@@ -117,7 +117,7 @@ struct RecvOperation {
       const cudaIpcEventHandle_t& startEvHandle,
       const cudaIpcMemHandle_t& remoteHandle) {
     CudaEvent startEv(startEvHandle);
-    startEv.wait(stream_);
+    startEv.wait(stream_, cudaDeviceForPointer(ptr_));
 
     void* remotePtr;
     TP_CUDA_CHECK(cudaIpcOpenMemHandle(
@@ -436,7 +436,6 @@ void Channel::Impl::onReply(const Reply& nopReply) {
   nopPacket.Become(nopPacket.index_of<Ack>());
 
   op.callback(error_);
-  sendOperations_.pop_front();
 
   connection_->write(
       *nopPacketHolder,
@@ -446,6 +445,8 @@ void Channel::Impl::onReply(const Reply& nopReply) {
                        << " done writing ACK notification (#" << sequenceNumber
                        << ")";
           }));
+
+  sendOperations_.pop_front();
 }
 
 void Channel::Impl::onAck() {
