@@ -34,7 +34,7 @@ ListenerImpl::ListenerImpl(
       sockaddr_(Sockaddr::createInetSockAddr(addr)) {}
 
 void ListenerImpl::initImplFromLoop() {
-  leak_ = shared_from_this();
+  context_->enroll(*this);
 
   handle_->initFromLoop();
   auto rv = handle_->bindFromLoop(sockaddr_);
@@ -66,13 +66,13 @@ void ListenerImpl::connectionCallbackFromLoop(int status) {
 
   auto connection = context_->createHandle();
   connection->initFromLoop();
-  handle_->acceptFromLoop(connection);
+  handle_->acceptFromLoop(*connection);
   callback_.trigger(Error::kSuccess, createConnection(std::move(connection)));
 }
 
 void ListenerImpl::closeCallbackFromLoop() {
   TP_VLOG(9) << "Listener " << id_ << " has finished closing its handle";
-  leak_.reset();
+  context_->unenroll(*this);
 }
 
 void ListenerImpl::handleErrorImpl() {
@@ -80,6 +80,8 @@ void ListenerImpl::handleErrorImpl() {
     return std::make_tuple(std::cref(error_), std::shared_ptr<Connection>());
   });
   handle_->closeFromLoop();
+  // Do NOT unenroll here, as we must keep the UV handle alive until the close
+  // callback fires.
 }
 
 } // namespace uv

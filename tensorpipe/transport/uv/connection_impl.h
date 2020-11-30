@@ -33,17 +33,17 @@ class ConnectionImpl final : public ConnectionImplBoilerplate<
  public:
   // Create a connection that is already connected (e.g. from a listener).
   ConnectionImpl(
-      ConstructorToken,
-      std::shared_ptr<ContextImpl>,
-      std::string,
-      std::shared_ptr<TCPHandle>);
+      ConstructorToken token,
+      std::shared_ptr<ContextImpl> context,
+      std::string id,
+      std::unique_ptr<TCPHandle> handle);
 
   // Create a connection that connects to the specified address.
   ConnectionImpl(
-      ConstructorToken,
-      std::shared_ptr<ContextImpl>,
-      std::string,
-      std::string);
+      ConstructorToken token,
+      std::shared_ptr<ContextImpl> context,
+      std::string id,
+      std::string addr);
 
  protected:
   // Implement the entry points called by ConnectionImplBoilerplate.
@@ -67,16 +67,11 @@ class ConnectionImpl final : public ConnectionImplBoilerplate<
   // Called when libuv has closed the handle.
   void closeCallbackFromLoop();
 
-  std::shared_ptr<TCPHandle> handle_;
+  const std::unique_ptr<TCPHandle> handle_;
   optional<Sockaddr> sockaddr_;
 
   std::deque<StreamReadOperation> readOperations_;
   std::deque<StreamWriteOperation> writeOperations_;
-
-  // By having the instance store a shared_ptr to itself we create a reference
-  // cycle which will "leak" the instance. This allows us to detach its
-  // lifetime from the connection and sync it with the TCPHandle's life cycle.
-  std::shared_ptr<ConnectionImpl> leak_;
 };
 
 } // namespace uv

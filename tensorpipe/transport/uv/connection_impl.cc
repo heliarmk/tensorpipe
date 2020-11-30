@@ -30,7 +30,7 @@ ConnectionImpl::ConnectionImpl(
     ConstructorToken token,
     std::shared_ptr<ContextImpl> context,
     std::string id,
-    std::shared_ptr<TCPHandle> handle)
+    std::unique_ptr<TCPHandle> handle)
     : ConnectionImplBoilerplate<ContextImpl, ListenerImpl, ConnectionImpl>(
           token,
           std::move(context),
@@ -50,7 +50,7 @@ ConnectionImpl::ConnectionImpl(
       sockaddr_(Sockaddr::createInetSockAddr(addr)) {}
 
 void ConnectionImpl::initImplFromLoop() {
-  leak_ = shared_from_this();
+  context_->enroll(*this);
 
   if (sockaddr_.has_value()) {
     handle_->initFromLoop();
@@ -170,7 +170,7 @@ void ConnectionImpl::closeCallbackFromLoop() {
   TP_DCHECK(context_->inLoop());
   TP_VLOG(9) << "Connection " << id_ << " has finished closing its handle";
   TP_DCHECK(writeOperations_.empty());
-  leak_.reset();
+  context_->unenroll(*this);
 }
 
 void ConnectionImpl::handleErrorImpl() {
@@ -182,6 +182,8 @@ void ConnectionImpl::handleErrorImpl() {
   // their corresponding UV write requests to complete (or else the user may
   // deallocate the buffers while the loop is still processing them).
   handle_->closeFromLoop();
+  // Do NOT unenroll here, as we must keep the UV handle alive until the close
+  // callback fires.
 }
 
 } // namespace uv

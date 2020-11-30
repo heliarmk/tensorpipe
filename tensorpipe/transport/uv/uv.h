@@ -8,90 +8,46 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
 
 #include <uv.h>
 
 #include <tensorpipe/common/callback.h>
 #include <tensorpipe/common/defs.h>
-#include <tensorpipe/common/optional.h>
 #include <tensorpipe/transport/uv/loop.h>
-#include <tensorpipe/transport/uv/macros.h>
 #include <tensorpipe/transport/uv/sockaddr.h>
+
+#define TP_THROW_UV(err) TP_THROW(std::runtime_error)
+#define TP_THROW_UV_IF(cond, err) \
+  if (unlikely(cond))             \
+  TP_THROW_UV(err) << TP_STRINGIFY(cond) << ": " << uv_strerror(err)
 
 namespace tensorpipe {
 namespace transport {
 namespace uv {
 
-// Libuv resources can be either a long lived handle (e.g. a socket), or a short
-// lived request (e.g. connecting a socket, reading bytes off a socket, etc.).
-// In either case, these resources must keep the underlying loop alive, and they
-// themselves must be kept alive until completed. To do the latter all resources
-// store a shared_ptr to themselves which is reset when they their lifetime is
-// up and can be safely destructed (see `leak` and `unleak` functions). The loop
-// on the other hand can't be destroyed until it has been joined and it can't be
-// joined until all its handles or requests have been closed.
 template <typename T, typename U>
-class BaseResource : public std::enable_shared_from_this<T> {
- protected:
-  // Use the passkey idiom to allow make_shared to call what should be a private
-  // constructor. See https://abseil.io/tips/134 for more information.
-  struct ConstructorToken {};
-
- public:
-  template <typename... Args>
-  static std::shared_ptr<T> create(Loop& loop, Args&&... args) {
-    auto resource = std::make_shared<T>(
-        ConstructorToken(), loop, std::forward<Args>(args)...);
-    resource->leak();
-    return resource;
-  }
-
-  explicit BaseResource(ConstructorToken /* unused */, Loop& loop)
-      : loop_(loop) {}
-
- protected:
-  // As long as the libuv handle of this instance is open the loop won't be
-  // destroyed.
-  Loop& loop_;
-
-  // Keep this instance alive by leaking it, until either:
-  // * the handle is closed, or...
-  // * the request has completed.
-  std::shared_ptr<T> leak_;
-
-  void leak() {
-    leak_ = this->shared_from_this();
-  }
-
-  void unleak() {
-    leak_.reset();
-  }
-
-  friend class Loop;
-};
-
-template <typename T, typename U>
-class BaseHandle : public BaseResource<T, U> {
+class BaseHandle {
   static void uv__close_cb(uv_handle_t* handle) {
     T& ref = *reinterpret_cast<T*>(handle->data);
-    if (ref.closeCallback_.has_value()) {
-      ref.closeCallback_.value()();
+    if (ref.closeCallback_ != nullptr) {
+      ref.closeCallback_();
     }
-    ref.unleak();
   }
 
  public:
   using TCloseCallback = std::function<void()>;
 
-  explicit BaseHandle(
-      typename BaseResource<T, U>::ConstructorToken /* unused */,
-      Loop& loop)
-      : BaseResource<T, U>::BaseResource(
-            typename BaseResource<T, U>::ConstructorToken(),
-            loop) {
+  explicit BaseHandle(Loop& loop) : loop_(loop) {
     handle_.data = this;
   }
+
+  // Libuv's handles cannot be copied or moved.
+  BaseHandle(const BaseHandle&) = delete;
+  BaseHandle(BaseHandle&&) = delete;
+  BaseHandle& operator=(const BaseHandle&) = delete;
+  BaseHandle& operator=(BaseHandle&&) = delete;
 
   virtual ~BaseHandle() = default;
 
@@ -101,76 +57,81 @@ class BaseHandle : public BaseResource<T, U> {
 
   void armCloseCallbackFromLoop(TCloseCallback fn) {
     TP_DCHECK(this->loop_.inLoop());
-    TP_THROW_ASSERT_IF(closeCallback_.has_value());
+    TP_THROW_ASSERT_IF(closeCallback_ != nullptr);
     closeCallback_ = std::move(fn);
   }
 
   void closeFromLoop() {
-    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(ptr()))) {
-      uv_close(reinterpret_cast<uv_handle_t*>(ptr()), uv__close_cb);
-    }
+    TP_DCHECK(!uv_is_closing(reinterpret_cast<uv_handle_t*>(ptr())));
+    uv_close(reinterpret_cast<uv_handle_t*>(ptr()), uv__close_cb);
   }
 
  protected:
   // Underlying libuv handle.
   U handle_;
 
-  optional<TCloseCallback> closeCallback_;
+  // As long as the libuv handle of this instance is open the loop won't be
+  // destroyed.
+  Loop& loop_;
+
+  TCloseCallback closeCallback_;
 };
 
 template <typename T, typename U>
-class BaseRequest : public BaseResource<T, U> {
+class BaseRequest {
  public:
-  explicit BaseRequest(
-      typename BaseResource<T, U>::ConstructorToken /* unused */,
-      Loop& loop)
-      : BaseResource<T, U>::BaseResource(
-            typename BaseResource<T, U>::ConstructorToken(),
-            loop) {
+  BaseRequest() {
     request_.data = this;
   }
+
+  // Libuv's requests cannot be copied or moved.
+  BaseRequest(const BaseRequest&) = delete;
+  BaseRequest(BaseRequest&&) = delete;
+  BaseRequest& operator=(const BaseRequest&) = delete;
+  BaseRequest& operator=(BaseRequest&&) = delete;
 
   U* ptr() {
     return &request_;
   }
 
- protected:
+ private:
   // Underlying libuv request.
   U request_;
 };
 
 class WriteRequest final : public BaseRequest<WriteRequest, uv_write_t> {
   static void uv__write_cb(uv_write_t* req, int status) {
-    WriteRequest* request = reinterpret_cast<WriteRequest*>(req->data);
-    request->writeCallback(status);
-    request->unleak();
+    std::unique_ptr<WriteRequest> request(
+        reinterpret_cast<WriteRequest*>(req->data));
+    request->writeCallback_(status);
   }
 
  public:
   using TWriteCallback = std::function<void(int status)>;
 
-  WriteRequest(ConstructorToken /* unused */, Loop& loop, TWriteCallback fn)
-      : BaseRequest<WriteRequest, uv_write_t>(ConstructorToken(), loop),
-        fn_(std::move(fn)) {}
+  WriteRequest(TWriteCallback fn) : writeCallback_(std::move(fn)) {}
 
-  uv_write_cb callback() {
-    return uv__write_cb;
+  static int perform(
+      uv_stream_t* handle,
+      const uv_buf_t bufs[],
+      unsigned int nbufs,
+      TWriteCallback fn) {
+    auto request = std::make_unique<WriteRequest>(std::move(fn));
+    auto rv = uv_write(request->ptr(), handle, bufs, nbufs, uv__write_cb);
+    request.release();
+    return rv;
   }
 
-  void writeCallback(int status) {
-    fn_(status);
-  }
-
- protected:
-  TWriteCallback fn_;
+ private:
+  TWriteCallback writeCallback_;
 };
 
 template <typename T, typename U>
 class StreamHandle : public BaseHandle<T, U> {
   static void uv__connection_cb(uv_stream_t* server, int status) {
     T& ref = *reinterpret_cast<T*>(server->data);
-    TP_DCHECK(ref.connectionCallback_.has_value());
-    ref.connectionCallback_.value()(status);
+    TP_DCHECK(ref.connectionCallback_ != nullptr);
+    ref.connectionCallback_(status);
   }
 
   static void uv__alloc_cb(
@@ -178,8 +139,8 @@ class StreamHandle : public BaseHandle<T, U> {
       size_t /* unused */,
       uv_buf_t* buf) {
     T& ref = *reinterpret_cast<T*>(handle->data);
-    TP_DCHECK(ref.allocCallback_.has_value());
-    ref.allocCallback_.value()(buf);
+    TP_DCHECK(ref.allocCallback_ != nullptr);
+    ref.allocCallback_(buf);
   }
 
   static void uv__read_cb(
@@ -187,8 +148,8 @@ class StreamHandle : public BaseHandle<T, U> {
       ssize_t nread,
       const uv_buf_t* buf) {
     T& ref = *reinterpret_cast<T*>(server->data);
-    TP_DCHECK(ref.readCallback_.has_value());
-    ref.readCallback_.value()(nread, buf);
+    TP_DCHECK(ref.readCallback_ != nullptr);
+    ref.readCallback_(nread, buf);
   }
 
   static constexpr int kBacklog = 128;
@@ -201,13 +162,11 @@ class StreamHandle : public BaseHandle<T, U> {
 
   using BaseHandle<T, U>::BaseHandle;
 
-  ~StreamHandle() override = default;
-
   // TODO Split this into a armConnectionCallback, a listenStart and a
   // listenStop method, to propagate the backpressure to the clients.
   void listenFromLoop(TConnectionCallback connectionCallback) {
     TP_DCHECK(this->loop_.inLoop());
-    TP_THROW_ASSERT_IF(connectionCallback_.has_value());
+    TP_THROW_ASSERT_IF(connectionCallback_ != nullptr);
     connectionCallback_ = std::move(connectionCallback);
     auto rv = uv_listen(
         reinterpret_cast<uv_stream_t*>(this->ptr()),
@@ -217,30 +176,30 @@ class StreamHandle : public BaseHandle<T, U> {
   }
 
   template <typename V>
-  void acceptFromLoop(std::shared_ptr<V> other) {
+  void acceptFromLoop(V& other) {
     TP_DCHECK(this->loop_.inLoop());
     auto rv = uv_accept(
         reinterpret_cast<uv_stream_t*>(this->ptr()),
-        reinterpret_cast<uv_stream_t*>(other->ptr()));
+        reinterpret_cast<uv_stream_t*>(other.ptr()));
     TP_THROW_UV_IF(rv < 0, rv);
   }
 
   void armAllocCallbackFromLoop(TAllocCallback fn) {
     TP_DCHECK(this->loop_.inLoop());
-    TP_THROW_ASSERT_IF(allocCallback_.has_value());
+    TP_THROW_ASSERT_IF(allocCallback_ != nullptr);
     allocCallback_ = std::move(fn);
   }
 
   void armReadCallbackFromLoop(TReadCallback fn) {
     TP_DCHECK(this->loop_.inLoop());
-    TP_THROW_ASSERT_IF(readCallback_.has_value());
+    TP_THROW_ASSERT_IF(readCallback_ != nullptr);
     readCallback_ = std::move(fn);
   }
 
   void readStartFromLoop() {
     TP_DCHECK(this->loop_.inLoop());
-    TP_THROW_ASSERT_IF(!allocCallback_.has_value());
-    TP_THROW_ASSERT_IF(!readCallback_.has_value());
+    TP_THROW_ASSERT_IF(allocCallback_ == nullptr);
+    TP_THROW_ASSERT_IF(readCallback_ == nullptr);
     auto rv = uv_read_start(
         reinterpret_cast<uv_stream_t*>(this->ptr()), uv__alloc_cb, uv__read_cb);
     TP_THROW_UV_IF(rv < 0, rv);
@@ -257,66 +216,84 @@ class StreamHandle : public BaseHandle<T, U> {
       unsigned int nbufs,
       WriteRequest::TWriteCallback fn) {
     TP_DCHECK(this->loop_.inLoop());
-    auto request = WriteRequest::create(this->loop_, std::move(fn));
-    auto rv = uv_write(
-        request->ptr(),
+    auto rv = WriteRequest::perform(
         reinterpret_cast<uv_stream_t*>(this->ptr()),
         bufs,
         nbufs,
-        request->callback());
+        std::move(fn));
     TP_THROW_UV_IF(rv < 0, rv);
   }
 
  protected:
-  optional<TConnectionCallback> connectionCallback_;
-  optional<TAllocCallback> allocCallback_;
-  optional<TReadCallback> readCallback_;
+  TConnectionCallback connectionCallback_;
+  TAllocCallback allocCallback_;
+  TReadCallback readCallback_;
 };
 
-class ConnectRequest : public BaseRequest<ConnectRequest, uv_connect_t> {
+class ConnectRequest final : public BaseRequest<ConnectRequest, uv_connect_t> {
   static void uv__connect_cb(uv_connect_t* req, int status) {
-    ConnectRequest* request = reinterpret_cast<ConnectRequest*>(req->data);
-    request->connectCallback(status);
-    request->unleak();
+    std::unique_ptr<ConnectRequest> request(
+        reinterpret_cast<ConnectRequest*>(req->data));
+    request->connectCallback_(status);
   }
 
  public:
   using TConnectCallback = std::function<void(int status)>;
 
-  ConnectRequest(
-      BaseResource<ConnectRequest, uv_connect_t>::ConstructorToken /* unused */,
-      Loop& loop,
-      TConnectCallback fn)
-      : BaseRequest<ConnectRequest, uv_connect_t>(
-            BaseResource<ConnectRequest, uv_connect_t>::ConstructorToken(),
-            loop),
-        fn_(std::move(fn)) {}
+  ConnectRequest(TConnectCallback fn) : connectCallback_(std::move(fn)) {}
 
-  uv_connect_cb callback() {
-    return uv__connect_cb;
+  static int perform(
+      uv_tcp_t* handle,
+      const struct sockaddr* addr,
+      TConnectCallback fn) {
+    auto request = std::make_unique<ConnectRequest>(std::move(fn));
+    auto rv = uv_tcp_connect(request->ptr(), handle, addr, uv__connect_cb);
+    request.release();
+    return rv;
   }
 
-  void connectCallback(int status) {
-    fn_(status);
-  }
-
- protected:
-  TConnectCallback fn_;
+ private:
+  TConnectCallback connectCallback_;
 };
 
 class TCPHandle : public StreamHandle<TCPHandle, uv_tcp_t> {
  public:
   using StreamHandle<TCPHandle, uv_tcp_t>::StreamHandle;
 
-  void initFromLoop();
+  void initFromLoop() {
+    TP_DCHECK(this->loop_.inLoop());
+    int rv;
+    rv = uv_tcp_init(loop_.ptr(), this->ptr());
+    TP_THROW_UV_IF(rv < 0, rv);
+    rv = uv_tcp_nodelay(this->ptr(), 1);
+    TP_THROW_UV_IF(rv < 0, rv);
+  }
 
-  [[nodiscard]] int bindFromLoop(const Sockaddr& addr);
+  [[nodiscard]] int bindFromLoop(const Sockaddr& addr) {
+    TP_DCHECK(this->loop_.inLoop());
+    auto rv = uv_tcp_bind(ptr(), addr.addr(), 0);
+    // We don't throw in case of errors here because sometimes we bind in order
+    // to try if an address works and want to handle errors gracefully.
+    return rv;
+  }
 
-  Sockaddr sockNameFromLoop();
+  Sockaddr sockNameFromLoop() {
+    TP_DCHECK(this->loop_.inLoop());
+    struct sockaddr_storage ss;
+    struct sockaddr* addr = reinterpret_cast<struct sockaddr*>(&ss);
+    int addrlen = sizeof(ss);
+    auto rv = uv_tcp_getsockname(ptr(), addr, &addrlen);
+    TP_THROW_UV_IF(rv < 0, rv);
+    return Sockaddr(addr, addrlen);
+  }
 
   void connectFromLoop(
       const Sockaddr& addr,
-      ConnectRequest::TConnectCallback fn);
+      ConnectRequest::TConnectCallback fn) {
+    TP_DCHECK(this->loop_.inLoop());
+    auto rv = ConnectRequest::perform(ptr(), addr.addr(), std::move(fn));
+    TP_THROW_UV_IF(rv < 0, rv);
+  }
 };
 
 struct AddrinfoDeleter {
@@ -327,7 +304,32 @@ struct AddrinfoDeleter {
 
 using Addrinfo = std::unique_ptr<struct addrinfo, AddrinfoDeleter>;
 
-std::tuple<int, Addrinfo> getAddrinfoFromLoop(Loop& loop, std::string hostname);
+inline std::tuple<int, Addrinfo> getAddrinfoFromLoop(
+    Loop& loop,
+    std::string hostname) {
+  struct addrinfo hints;
+  std::memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_protocol = IPPROTO_TCP;
+
+  uv_getaddrinfo_t request;
+  // Don't use a callback, and thus perform the call synchronously, because the
+  // asynchronous version uses a thread pool, and it's not worth spawning new
+  // threads for a functionality which is used so sparingly.
+  auto rv = uv_getaddrinfo(
+      loop.ptr(),
+      &request,
+      /*getaddrinfo_cb=*/nullptr,
+      hostname.c_str(),
+      /*service=*/nullptr,
+      &hints);
+  if (rv != 0) {
+    return std::make_tuple(rv, Addrinfo());
+  }
+
+  return std::make_tuple(0, Addrinfo(request.addrinfo, AddrinfoDeleter()));
+}
 
 struct InterfaceAddressesDeleter {
   int count_{-1};
@@ -344,11 +346,37 @@ struct InterfaceAddressesDeleter {
 using InterfaceAddresses =
     std::unique_ptr<uv_interface_address_t[], InterfaceAddressesDeleter>;
 
-std::tuple<int, InterfaceAddresses, int> getInterfaceAddresses();
+inline std::tuple<int, InterfaceAddresses, int> getInterfaceAddresses() {
+  uv_interface_address_t* info;
+  int count;
+  auto rv = uv_interface_addresses(&info, &count);
+  if (rv != 0) {
+    return std::make_tuple(rv, InterfaceAddresses(), 0);
+  }
+  return std::make_tuple(
+      0, InterfaceAddresses(info, InterfaceAddressesDeleter(count)), count);
+}
 
-std::tuple<int, std::string> getHostname();
+inline std::tuple<int, std::string> getHostname() {
+  std::array<char, UV_MAXHOSTNAMESIZE> hostname;
+  size_t size = hostname.size();
+  auto rv = uv_os_gethostname(hostname.data(), &size);
+  if (rv != 0) {
+    return std::make_tuple(rv, std::string());
+  }
+  return std::make_tuple(
+      0, std::string(hostname.data(), hostname.data() + size));
+}
 
-std::string formatUvError(int status);
+inline std::string formatUvError(int status) {
+  if (status == 0) {
+    return "success";
+  } else {
+    std::ostringstream ss;
+    ss << uv_err_name(status) << ": " << uv_strerror(status);
+    return ss.str();
+  }
+}
 
 } // namespace uv
 } // namespace transport
