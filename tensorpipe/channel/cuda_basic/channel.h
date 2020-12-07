@@ -9,17 +9,20 @@
 #pragma once
 
 #include <memory>
-#include <string>
 
 #include <tensorpipe/channel/channel.h>
 #include <tensorpipe/channel/cpu_context.h>
-#include <tensorpipe/channel/xth/context.h>
+#include <tensorpipe/channel/cuda_basic/context.h>
+#include <tensorpipe/channel/cuda_context.h>
 
 namespace tensorpipe {
-namespace channel {
-namespace xth {
 
-class Channel : public channel::CpuChannel {
+class CudaLoop;
+
+namespace channel {
+namespace cuda_basic {
+
+class Channel : public channel::CudaChannel {
   // Use the passkey idiom to allow make_shared to call what should be a private
   // constructor. See https://abseil.io/tips/134 for more information.
   struct ConstructorToken {};
@@ -28,17 +31,18 @@ class Channel : public channel::CpuChannel {
   Channel(
       ConstructorToken token,
       std::shared_ptr<Context::PrivateIface> context,
-      std::shared_ptr<transport::Connection> connection,
+      std::shared_ptr<CpuChannel> cpuChannel,
+      CudaLoop& cudaLoop,
       std::string id);
 
   // Send memory region to peer.
   void send(
-      CpuBuffer buffer,
+      CudaBuffer buffer,
       TDescriptorCallback descriptorCallback,
       TSendCallback callback) override;
 
   // Receive memory region from peer.
-  void recv(TDescriptor descriptor, CpuBuffer buffer, TRecvCallback callback)
+  void recv(TDescriptor descriptor, CudaBuffer buffer, TRecvCallback callback)
       override;
 
   // Tell the channel what its identifier is.
@@ -59,6 +63,6 @@ class Channel : public channel::CpuChannel {
   friend class Context;
 };
 
-} // namespace xth
+} // namespace cuda_basic
 } // namespace channel
 } // namespace tensorpipe

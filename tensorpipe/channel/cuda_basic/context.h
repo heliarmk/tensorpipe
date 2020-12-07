@@ -12,18 +12,19 @@
 #include <string>
 
 #include <tensorpipe/channel/cpu_context.h>
+#include <tensorpipe/channel/cuda_context.h>
 
 namespace tensorpipe {
 namespace channel {
-namespace basic {
+namespace cuda_basic {
 
-class Context : public channel::CpuContext {
+class Context : public channel::CudaContext {
  public:
-  Context();
+  explicit Context(std::shared_ptr<CpuContext> cpuContext);
 
   const std::string& domainDescriptor() const override;
 
-  std::shared_ptr<CpuChannel> createChannel(
+  std::shared_ptr<CudaChannel> createChannel(
       std::shared_ptr<transport::Connection> connection,
       Endpoint endpoint) override;
 
@@ -50,6 +51,6 @@ class Context : public channel::CpuContext {
   friend class Channel;
 };
 
-} // namespace basic
+} // namespace cuda_basic
 } // namespace channel
 } // namespace tensorpipe

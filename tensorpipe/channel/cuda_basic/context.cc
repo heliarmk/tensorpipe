@@ -6,48 +6,29 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <tensorpipe/channel/cuda_xth/context.h>
+#include <tensorpipe/channel/cuda_basic/context.h>
 
-#include <unistd.h>
+#include <algorithm>
+#include <list>
 
-#include <cstring>
-#include <limits>
-
-#include <tensorpipe/channel/cuda_xth/channel.h>
+#include <tensorpipe/channel/cuda_basic/channel.h>
+#include <tensorpipe/channel/cuda_basic/context_impl.h>
 #include <tensorpipe/channel/error.h>
 #include <tensorpipe/channel/helpers.h>
 #include <tensorpipe/common/callback.h>
+#include <tensorpipe/common/cuda_loop.h>
 #include <tensorpipe/common/defs.h>
+#include <tensorpipe/common/error.h>
 #include <tensorpipe/common/error_macros.h>
-#include <tensorpipe/common/optional.h>
-#include <tensorpipe/common/queue.h>
-#include <tensorpipe/common/system.h>
 
 namespace tensorpipe {
 namespace channel {
-namespace cuda_xth {
-
-namespace {
-
-std::string generateDomainDescriptor() {
-  std::ostringstream oss;
-  auto bootID = getBootID();
-  TP_THROW_ASSERT_IF(!bootID) << "Unable to read boot_id";
-
-  pid_t pid = getpid();
-
-  // Combine boot ID and PID.
-  oss << bootID.value() << "-" << pid;
-
-  return oss.str();
-}
-
-} // namespace
+namespace cuda_basic {
 
 class Context::Impl : public Context::PrivateIface,
                       public std::enable_shared_from_this<Context::Impl> {
  public:
-  Impl();
+  explicit Impl(std::shared_ptr<CpuContext> cpuContext);
 
   const std::string& domainDescriptor() const;
 
@@ -66,11 +47,13 @@ class Context::Impl : public Context::PrivateIface,
   ~Impl() override = default;
 
  private:
-  std::string domainDescriptor_;
   std::atomic<bool> closed_{false};
   std::atomic<bool> joined_{false};
   ClosingEmitter closingEmitter_;
 
+  std::shared_ptr<CpuContext> cpuContext_;
+  // TODO: Lazy initialization of cuda loop.
+  CudaLoop cudaLoop_;
   // An identifier for the context, composed of the identifier for the context,
   // combined with the channel's name. It will only be used for logging and
   // debugging purposes.
@@ -80,13 +63,13 @@ class Context::Impl : public Context::PrivateIface,
   // their identifiers based off this context's identifier. They will only be
   // used for logging and debugging.
   std::atomic<uint64_t> channelCounter_{0};
-
-  void handleCopyRequests_();
 };
 
-Context::Context() : impl_(std::make_shared<Context::Impl>()) {}
+Context::Context(std::shared_ptr<CpuContext> cpuContext)
+    : impl_(std::make_shared<Impl>(std::move(cpuContext))) {}
 
-Context::Impl::Impl() : domainDescriptor_(generateDomainDescriptor()) {}
+Context::Impl::Impl(std::shared_ptr<CpuContext> cpuContext)
+    : cpuContext_(std::move(cpuContext)) {}
 
 void Context::close() {
   impl_->close();
@@ -94,11 +77,9 @@ void Context::close() {
 
 void Context::Impl::close() {
   if (!closed_.exchange(true)) {
-    TP_VLOG(4) << "Channel context " << id_ << " is closing";
-
     closingEmitter_.close();
-
-    TP_VLOG(4) << "Channel context " << id_ << " done closing";
+    cpuContext_->close();
+    cudaLoop_.close();
   }
 }
 
@@ -110,8 +91,8 @@ void Context::Impl::join() {
   close();
 
   if (!joined_.exchange(true)) {
-    TP_VLOG(4) << "Channel context " << id_ << " is joining";
-    TP_VLOG(4) << "Channel context " << id_ << " done joining";
+    cpuContext_->join();
+    cudaLoop_.join();
   }
 }
 
@@ -124,8 +105,8 @@ void Context::setId(std::string id) {
 }
 
 void Context::Impl::setId(std::string id) {
-  TP_VLOG(4) << "Channel context " << id_ << " was renamed to " << id;
   id_ = std::move(id);
+  cpuContext_->setId(id_ + ".cpu");
 }
 
 ClosingEmitter& Context::Impl::getClosingEmitter() {
@@ -137,7 +118,7 @@ const std::string& Context::domainDescriptor() const {
 }
 
 const std::string& Context::Impl::domainDescriptor() const {
-  return domainDescriptor_;
+  return cpuContext_->domainDescriptor();
 }
 
 std::shared_ptr<channel::CudaChannel> Context::createChannel(
@@ -148,18 +129,20 @@ std::shared_ptr<channel::CudaChannel> Context::createChannel(
 
 std::shared_ptr<channel::CudaChannel> Context::Impl::createChannel(
     std::shared_ptr<transport::Connection> connection,
-    Endpoint /* unused */) {
-  TP_THROW_ASSERT_IF(joined_);
+    Endpoint endpoint) {
   std::string channelId = id_ + ".c" + std::to_string(channelCounter_++);
   TP_VLOG(4) << "Channel context " << id_ << " is opening channel "
              << channelId;
+  auto cpuChannel = cpuContext_->createChannel(std::move(connection), endpoint);
+
   return std::make_shared<Channel>(
       Channel::ConstructorToken(),
       std::static_pointer_cast<PrivateIface>(shared_from_this()),
-      std::move(connection),
+      std::move(cpuChannel),
+      cudaLoop_,
       std::move(channelId));
 }
 
-} // namespace cuda_xth
+} // namespace cuda_basic
 } // namespace channel
 } // namespace tensorpipe
